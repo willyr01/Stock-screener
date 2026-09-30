@@ -113,9 +113,14 @@ st.caption("Great businesses at fair prices, already in an uptrend. S&P 500, "
 try:
     raw, fetched_at = get_data()
 except Exception as e:
-    st.error(f"Couldn't load market data: {e}\n\nYahoo may be rate-limiting. "
-             "Wait a few minutes, then tap **Refresh market data**.")
+    st.error(f"**Couldn't load market data.** {e}\n\n"
+             "Nothing was saved, so the app will try again fresh. Wait 15–30 minutes, "
+             "then tap **Refresh market data** in the sidebar. If this keeps happening, "
+             "Yahoo is blocking Streamlit's servers, and the screener needs a different "
+             "data source.")
     st.stop()
+
+have = int(raw["data_error"].isna().sum()) if "data_error" in raw else len(raw)
 
 df = sc.evaluate(raw, T, exclude_cyclicals, consistent)
 passed = df[df["PASSED"]]
@@ -125,7 +130,8 @@ c1, c2, c3 = st.columns(3)
 c1.metric("Stocks scanned", len(df))
 c2.metric("Passed every check", len(passed))
 c3.metric("Missed by one check", len(near))
-st.caption(f"Market data from {fetched_at:%b %d, %I:%M %p}. Changing rules updates instantly.")
+st.caption(f"Market data from {fetched_at:%b %d, %I:%M %p} · company financials loaded for "
+           f"{have} of {len(raw)} stocks. Changing rules updates instantly.")
 
 PCT_COLS = ["pct_above_200dma", "momentum_12_1", "roe", "roa", "op_margin", "fcf_yield",
             "fcf_conversion", "revenue_growth", "earnings_growth"]

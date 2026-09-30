@@ -1,5 +1,5 @@
 streamlit>=1.38
-yfinance
+yfinance>=0.2.54
 pandas
 lxml
 requests

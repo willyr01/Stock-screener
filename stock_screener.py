@@ -25,6 +25,7 @@ Finance via the unofficial `yfinance` library and can be wrong or rate-limited.
 """
 
 import time
+import random
 import datetime as dt
 from io import StringIO
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -58,7 +59,8 @@ DEFAULT_T = {
 
 ALWAYS_EXCLUDED = {"Financials", "Real Estate"}
 CYCLICAL_SECTORS = {"Energy", "Materials"}
-WORKERS = 6
+WORKERS = 3
+MIN_COVERAGE = 0.5   # refuse results if under half the stocks got fundamentals
 RETRIES = 3
 
 try:
@@ -230,9 +232,24 @@ def profitable_every_year(income):
     return None
 
 
+class NoFundamentals(Exception):
+    """Yahoo answered but sent back no fundamentals (usually a soft block)."""
+
+
+def _get_info(t):
+    info = t.info or {}
+    # A real response has dozens of fields. A near-empty one means Yahoo
+    # withheld the data, so treat it as a failure and retry instead of
+    # silently recording every metric as missing.
+    if len(info) < 10 or num(info.get("marketCap")) is None:
+        raise NoFundamentals()
+    return info
+
+
 def fetch_one(ticker):
+    time.sleep(random.uniform(0.2, 0.8))  # be gentle; bursts get blocked
     t = yf.Ticker(ticker)
-    info = retry(lambda: t.info)
+    info = retry(lambda: _get_info(t))
     m = fundamental_metrics(info)
     m.update(piotroski=None, piotroski_computed=None, profitable_all_years=None)
     # Stocks with no profit or no free cash flow fail the quality gate at ANY
@@ -263,15 +280,31 @@ def fetch_all(progress=None):
                        **trend_metrics(closes[r.ticker] if r.ticker in closes else pd.Series(dtype=float))}
             for r in uni.itertuples()}
 
+    ok = failed = 0
     with ThreadPoolExecutor(max_workers=WORKERS) as pool:
         futures = {pool.submit(fetch_one, tk): tk for tk in tickers}
         for i, fut in enumerate(as_completed(futures), 1):
             tk = futures[fut]
             try:
                 rows[tk].update(fut.result())
+                ok += 1
             except Exception as e:
-                rows[tk]["data_error"] = type(e).__name__
+                rows[tk]["data_error"] = "Yahoo sent no fundamentals" \
+                    if isinstance(e, NoFundamentals) else type(e).__name__
+                failed += 1
             say(i, len(tickers), "Checking fundamentals")
+            # If the first 30 all fail, Yahoo is blocking us; stop early.
+            if ok == 0 and failed >= 30:
+                for f in futures:
+                    f.cancel()
+                raise RuntimeError(
+                    "Yahoo Finance is refusing to send company fundamentals to this "
+                    "server (prices still work). This is a block on Yahoo's side.")
+
+    if ok < MIN_COVERAGE * len(tickers):
+        raise RuntimeError(
+            f"Yahoo only sent fundamentals for {ok} of {len(tickers)} stocks, too few "
+            "for trustworthy results. It's likely rate-limiting this server.")
 
     return pd.DataFrame(rows.values())
 
