@@ -251,7 +251,7 @@ def fetch_one(ticker):
     t = yf.Ticker(ticker)
     info = retry(lambda: _get_info(t))
     m = fundamental_metrics(info)
-    m.update(piotroski=None, piotroski_computed=None, profitable_all_years=None)
+    m.update(piotroski=None, piotroski_computed=None, piotroski_max=9, profitable_all_years=None)
     # Stocks with no profit or no free cash flow fail the quality gate at ANY
     # threshold, so skip their annual reports to save time.
     ni, fcf = num(info.get("netIncomeToCommon")), num(info.get("freeCashflow"))
@@ -263,13 +263,136 @@ def fetch_one(ticker):
     return m
 
 
-def fetch_all(progress=None):
+# ---------------------------------------------------------------------------
+# Data: fundamentals from Finnhub (used when an API key is provided)
+# ---------------------------------------------------------------------------
+FINNHUB_URL = "https://finnhub.io/api/v1/stock/metric"
+FINNHUB_PACE = 1.05          # seconds between calls; free tier allows ~60/minute
+PCT_FIELDS = ["roe", "roa", "op_margin", "revenue_growth", "earnings_growth"]
+
+
+class FinnhubKeyError(Exception):
+    pass
+
+
+def _pick(*vals):
+    for v in vals:
+        if v is not None:
+            return v
+    return None
+
+
+def _series(src, name):
+    """Values of an annual/quarterly Finnhub series, newest first."""
+    pts = [p for p in (src or {}).get(name) or [] if num(p.get("v")) is not None]
+    pts.sort(key=lambda p: str(p.get("period")), reverse=True)
+    return [float(p["v"]) for p in pts]
+
+
+def finnhub_metrics(js):
+    """Turn one /stock/metric response into the screen's fields.
+    Percent-style fields are left in Finnhub's units here; fetch_all()
+    detects the unit across all stocks and converts to fractions."""
+    m = js.get("metric") or {}
+    ann = (js.get("series") or {}).get("annual") or {}
+    qtr = (js.get("series") or {}).get("quarterly") or {}
+    g = lambda *keys: _pick(*(num(m.get(k)) for k in keys))
+    latest = lambda src, name: (_series(src, name) or [None])[0]
+
+    pe = _pick(g("peTTM", "peExclExtraTTM", "peBasicExclExtraTTM"), latest(qtr, "peTTM"))
+    pfcf = _pick(g("pfcfShareTTM"), latest(qtr, "pfcfTTM"))
+    mcap = g("marketCapitalization")  # millions of dollars
+
+    out = {
+        "roe": g("roeTTM", "roeRfy"),
+        "roa": g("roaTTM", "roaRfy"),
+        "op_margin": g("operatingMarginTTM", "operatingMarginAnnual"),
+        "debt_to_equity": g("totalDebt/totalEquityQuarterly", "totalDebt/totalEquityAnnual"),
+        "current_ratio": g("currentRatioQuarterly", "currentRatioAnnual"),
+        "revenue_growth": g("revenueGrowthTTMYoy", "revenueGrowthQuarterlyYoy"),
+        "earnings_growth": g("epsGrowthTTMYoy", "epsGrowthQuarterlyYoy"),
+        "trailing_pe": pe,
+        "forward_pe": g("forwardPE", "peForward"),          # usually absent on free tier
+        "ev_ebitda": g("currentEv/ebitdaTTM", "evEbitdaTTM"),  # usually absent on free tier
+        # Free-cash-flow yield = 1 / (price / FCF). Negative FCF gives a negative yield.
+        "fcf_yield": 1 / pfcf if pfcf else None,
+        # FCF / earnings = (price/earnings) / (price/FCF). Unit-free.
+        "fcf_conversion": pe / pfcf if pe and pfcf and pe > 0 else None,
+        "market_cap_bn": mcap / 1000 if mcap else None,
+    }
+
+    # Piotroski-style score from Finnhub's annual history. Finnhub's free data has
+    # no share counts, so the dilution test is left out: the score is out of 8.
+    roa, nm, gm = _series(ann, "roa"), _series(ann, "netMargin"), _series(ann, "grossMargin")
+    fcfm, cr, ltd = _series(ann, "fcfMargin"), _series(ann, "currentRatio"), _series(ann, "longtermDebtTotalAsset")
+    two = lambda s: len(s) >= 2
+    signals = []
+
+    def sig(ok_fn, *need):
+        signals.append(bool(ok_fn()) if all(need) else None)
+
+    sig(lambda: roa[0] > 0, roa)                              # profitable
+    sig(lambda: fcfm[0] > 0, fcfm)                            # positive cash flow
+    sig(lambda: roa[0] > roa[1], two(roa))                    # ROA improving
+    sig(lambda: fcfm[0] > nm[0], fcfm, nm)                    # cash beats accounting profit
+    sig(lambda: ltd[0] <= ltd[1], two(ltd))                   # leverage not rising
+    sig(lambda: cr[0] > cr[1], two(cr))                       # liquidity improving
+    sig(lambda: gm[0] > gm[1], two(gm))                       # gross margin improving
+    turn = [r / n for r, n in zip(roa, nm) if n]              # sales/assets = ROA / net margin
+    sig(lambda: turn[0] > turn[1], two(turn))                 # asset turnover improving
+    if not ltd:   # company reports no long-term debt: leverage can't have risen
+        signals[4] = True
+
+    out["piotroski"] = sum(1 for s in signals if s)
+    out["piotroski_computed"] = sum(1 for s in signals if s is not None)
+    out["piotroski_max"] = 8
+    recent = nm[:4]
+    out["profitable_all_years"] = bool(all(v > 0 for v in recent)) if len(recent) >= 3 else None
+    return out
+
+
+def fetch_finnhub(symbol, key, session):
+    sym = symbol.replace("-", ".")  # BRK-B -> BRK.B
+    for attempt in range(4):
+        r = session.get(FINNHUB_URL, params={"symbol": sym, "metric": "all", "token": key},
+                        timeout=20)
+        if r.status_code == 401:
+            raise FinnhubKeyError("Finnhub rejected the API key. Check the FINNHUB_API_KEY "
+                                  "line in the app's Secrets settings.")
+        if r.status_code == 429:           # over the per-minute limit: back off
+            time.sleep(10 * (attempt + 1))
+            continue
+        r.raise_for_status()
+        js = r.json()
+        if not (js.get("metric") or {}):
+            raise NoFundamentals()
+        return finnhub_metrics(js)
+    raise RuntimeError("Finnhub rate limit")
+
+
+def normalize_units(df):
+    """Finnhub reports percentages (15 = 15%); the rules use fractions (0.15).
+    Detect the unit from the whole universe rather than assuming it."""
+    for c in PCT_FIELDS:
+        if c in df and df[c].notna().any() and df[c].abs().median() > 1.5:
+            df[c] = df[c] / 100
+    # Debt-to-equity rules are in percent (100 = debt equals equity).
+    c = "debt_to_equity"
+    if c in df and df[c].notna().any() and df[c].abs().median() < 10:
+        df[c] = df[c] * 100
+    return df
+
+
+def fetch_all(progress=None, finnhub_key=None):
     """Download everything the screen needs. Slow (several minutes); run once,
     then call evaluate() as many times as you like with different thresholds.
+    Prices always come from Yahoo. Company financials come from Finnhub when a
+    key is given, otherwise from Yahoo.
     progress: optional callback(done, total, label)."""
     if yf is None:
         raise RuntimeError("Missing library. Run: pip install yfinance pandas lxml requests")
     say = progress or (lambda d, t, label: None)
+    source = "Finnhub" if finnhub_key else "Yahoo"
 
     uni = get_universe()
     tickers = uni["ticker"].tolist()
@@ -281,42 +404,88 @@ def fetch_all(progress=None):
             for r in uni.itertuples()}
 
     ok = failed = 0
-    with ThreadPoolExecutor(max_workers=WORKERS) as pool:
-        futures = {pool.submit(fetch_one, tk): tk for tk in tickers}
-        for i, fut in enumerate(as_completed(futures), 1):
-            tk = futures[fut]
+    first_error = None
+
+    def record(tk, result=None, err=None):
+        nonlocal ok, failed, first_error
+        if err is None:
+            rows[tk].update(result)
+            ok += 1
+        else:
+            rows[tk]["data_error"] = (f"{source} sent no fundamentals"
+                                      if isinstance(err, NoFundamentals) else type(err).__name__)
+            first_error = first_error or err
+            failed += 1
+
+    def blocked():
+        return ok == 0 and failed >= (15 if finnhub_key else 30)
+
+    if finnhub_key:
+        import requests
+        session = requests.Session()
+        for i, tk in enumerate(tickers, 1):
+            start = time.time()
             try:
-                rows[tk].update(fut.result())
-                ok += 1
+                record(tk, fetch_finnhub(tk, finnhub_key, session))
+            except FinnhubKeyError:
+                raise
             except Exception as e:
-                rows[tk]["data_error"] = "Yahoo sent no fundamentals" \
-                    if isinstance(e, NoFundamentals) else type(e).__name__
-                failed += 1
-            say(i, len(tickers), "Checking fundamentals")
-            # If the first 30 all fail, Yahoo is blocking us; stop early.
-            if ok == 0 and failed >= 30:
-                for f in futures:
-                    f.cancel()
-                raise RuntimeError(
-                    "Yahoo Finance is refusing to send company fundamentals to this "
-                    "server (prices still work). This is a block on Yahoo's side.")
+                record(tk, err=e)
+            say(i, len(tickers), "Checking fundamentals (Finnhub)")
+            if blocked():
+                raise RuntimeError(f"Finnhub isn't returning data ({first_error!r}).")
+            time.sleep(max(0.0, FINNHUB_PACE - (time.time() - start)))
+    else:
+        with ThreadPoolExecutor(max_workers=WORKERS) as pool:
+            futures = {pool.submit(fetch_one, tk): tk for tk in tickers}
+            for i, fut in enumerate(as_completed(futures), 1):
+                tk = futures[fut]
+                try:
+                    record(tk, fut.result())
+                except Exception as e:
+                    record(tk, err=e)
+                say(i, len(tickers), "Checking fundamentals")
+                if blocked():
+                    for f in futures:
+                        f.cancel()
+                    raise RuntimeError(
+                        "Yahoo Finance is refusing to send company fundamentals to this "
+                        "server (prices still work). This is a block on Yahoo's side.")
 
     if ok < MIN_COVERAGE * len(tickers):
         raise RuntimeError(
-            f"Yahoo only sent fundamentals for {ok} of {len(tickers)} stocks, too few "
-            "for trustworthy results. It's likely rate-limiting this server.")
+            f"{source} only sent fundamentals for {ok} of {len(tickers)} stocks, too few "
+            "for trustworthy results.")
 
-    return pd.DataFrame(rows.values())
+    df = pd.DataFrame(rows.values())
+    if finnhub_key:
+        df = normalize_units(df)
+    df["source"] = source
+    return df
 
 
 # ---------------------------------------------------------------------------
 # Rules: apply thresholds to already-downloaded data (instant)
 # ---------------------------------------------------------------------------
-def failed_checks(r, T, require_consistent_profit=True):
+CHECK_FIELDS = ["roe", "roa", "op_margin", "debt_to_equity", "current_ratio", "fcf_conversion",
+                "revenue_growth", "earnings_growth", "trailing_pe", "forward_pe", "ev_ebitda",
+                "fcf_yield", "piotroski"]
+
+
+def unavailable_checks(raw):
+    """Fields the data source didn't supply for ANY stock. Those checks are
+    skipped (not failed), since failing every stock on them would be meaningless."""
+    return [c for c in CHECK_FIELDS
+            if c not in raw or pd.to_numeric(raw[c], errors="coerce").notna().sum() == 0]
+
+
+def failed_checks(r, T, require_consistent_profit=True, skip=()):
     f = []
     g = lambda k: num(r.get(k))
 
     def check(label, key, ok):
+        if key in skip:
+            return
         v = g(key)
         if v is None:
             f.append(f"{label}: no data")
@@ -372,7 +541,8 @@ def evaluate(raw, T=None, exclude_cyclicals=True, require_consistent_profit=True
     df = raw.copy()
     if exclude_cyclicals:
         df = df[~df["sector"].isin(CYCLICAL_SECTORS)]
-    fails = [failed_checks(r, T, require_consistent_profit) for r in df.to_dict("records")]
+    skip = unavailable_checks(raw)
+    fails = [failed_checks(r, T, require_consistent_profit, skip) for r in df.to_dict("records")]
     df["PASSED"] = [not f for f in fails]
     df["num_failed"] = [len(f) for f in fails]
     df["failed_checks"] = ["; ".join(f) for f in fails]
@@ -382,17 +552,33 @@ def evaluate(raw, T=None, exclude_cyclicals=True, require_consistent_profit=True
                           ascending=[False, True, False]).reset_index(drop=True)
 
 
+def default_thresholds(raw):
+    """Defaults, adjusted for the data source. Finnhub's F-score is out of 8
+    (no dilution test), so the equivalent strict bar is 6 instead of 7."""
+    T = dict(DEFAULT_T)
+    if "piotroski_max" in raw and pd.to_numeric(raw["piotroski_max"], errors="coerce").max() == 8:
+        T["min_piotroski"] = 6
+    return T
+
+
 # ---------------------------------------------------------------------------
 # Command-line use
 # ---------------------------------------------------------------------------
 def main():
+    import os
+    key = os.environ.get("FINNHUB_API_KEY")
+
     def progress(done, total, label):
-        if label != "Checking fundamentals" or done % 50 == 0 or done == total:
+        if not label.startswith("Checking") or done % 50 == 0 or done == total:
             print(f"  {label} ... {done}/{total}" if total > 1 else f"  {label} ...")
 
-    print("Fetching data (this takes several minutes) ...")
-    raw = fetch_all(progress)
-    df = evaluate(raw)
+    print(f"Fetching data with financials from {'Finnhub' if key else 'Yahoo'} "
+          "(this takes several minutes) ...")
+    raw = fetch_all(progress, key)
+    df = evaluate(raw, default_thresholds(raw))
+    skipped = unavailable_checks(raw)
+    if skipped:
+        print(f"  Skipped (not provided by data source): {', '.join(skipped)}")
 
     fname = f"screen_results_{dt.date.today():%Y-%m-%d}.csv"
     df.to_csv(fname, index=False, float_format="%.4f")
