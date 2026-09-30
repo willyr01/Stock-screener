@@ -9,6 +9,8 @@ Secrets, otherwise from Yahoo. Prices always come from Yahoo.
 """
 import datetime as dt
 from collections import Counter
+from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
@@ -16,6 +18,9 @@ import streamlit as st
 import stock_screener as sc
 
 st.set_page_config(page_title="Stock Screener", page_icon="📈", layout="wide")
+
+SAVED = Path(__file__).parent / "data" / "screener_data.csv"
+ET = ZoneInfo("America/New_York")
 
 
 def finnhub_key():
@@ -26,14 +31,24 @@ def finnhub_key():
 
 
 # ---------------------------------------------------------------------------
-# Data (downloaded once, cached for 12 hours, shared by everyone using the app)
+# Data. Normally read from the file GitHub saves every weekday evening (instant).
+# If that file doesn't exist yet, fall back to downloading live (slow).
 # ---------------------------------------------------------------------------
+@st.cache_data(show_spinner=False)
+def load_saved(_mtime):        # re-reads whenever the file changes
+    raw = pd.read_csv(SAVED)
+    ts = pd.to_datetime(raw["fetched_at"].iloc[0], utc=True) if "fetched_at" in raw else None
+    return raw, (ts.tz_convert(ET).to_pydatetime() if ts is not None else None)
+
+
 @st.cache_data(ttl=12 * 3600, show_spinner=False)
 def load_data(key, _progress=None):
-    return sc.fetch_all(_progress, key), dt.datetime.now()
+    return sc.fetch_all(_progress, key), dt.datetime.now(ET)
 
 
 def get_data(key):
+    if SAVED.exists():
+        return load_saved(SAVED.stat().st_mtime) + (True,)
     bar = st.progress(0.0, text="Loading market data. First load takes about 8 minutes...")
 
     def progress(done, total, label):
@@ -41,7 +56,7 @@ def get_data(key):
 
     raw, fetched_at = load_data(key, progress)
     bar.empty()
-    return raw, fetched_at
+    return raw, fetched_at, False
 
 
 st.title("📈 Stock Screener")
@@ -50,7 +65,7 @@ st.caption("Great businesses at fair prices, already in an uptrend. S&P 500, "
 
 KEY = finnhub_key()
 try:
-    raw, fetched_at = get_data(KEY)
+    raw, fetched_at, FROM_FILE = get_data(KEY)
 except Exception as e:
     hint = ("Check that the **FINNHUB_API_KEY** line in Secrets is correct, then tap "
             "**Refresh market data**." if isinstance(e, sc.FinnhubKeyError) else
@@ -135,7 +150,9 @@ with st.sidebar:
                 T[key] = v / 100 if pct else v
 
     st.button("Reset to defaults", on_click=reset_rules, use_container_width=True)
-    if st.button("Refresh market data", use_container_width=True):
+    if FROM_FILE:
+        st.caption("Data refreshes automatically every weekday evening.")
+    elif st.button("Refresh market data", use_container_width=True):
         load_data.clear()
         st.rerun()
 
@@ -152,8 +169,12 @@ c1, c2, c3 = st.columns(3)
 c1.metric("Stocks scanned", len(df))
 c2.metric("Passed every check", len(passed))
 c3.metric("Missed by one check", len(near))
-st.caption(f"Data from {fetched_at:%b %d, %I:%M %p} · prices from Yahoo, financials from "
+when = f"{fetched_at:%a %b %d, %I:%M %p} ET" if fetched_at else "unknown time"
+st.caption(f"Data from {when} · prices from Yahoo, financials from "
            f"{SOURCE} for {have} of {len(raw)} stocks. Changing rules updates instantly.")
+if FROM_FILE and fetched_at and (dt.datetime.now(ET) - fetched_at).days >= 4:
+    st.warning("This data is several days old. The scheduled update may be failing. "
+               "Check the **Actions** tab of your GitHub repository.")
 
 PCT_COLS = ["pct_above_200dma", "momentum_12_1", "roe", "roa", "op_margin", "fcf_yield",
             "fcf_conversion", "revenue_growth", "earnings_growth"]
