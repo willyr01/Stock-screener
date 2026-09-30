@@ -1,0 +1,38 @@
+# Refreshes the screener's data every weekday evening and saves it to the repo.
+# The Streamlit app reads the saved file, so it loads in seconds.
+name: Update screener data
+
+on:
+  schedule:
+    - cron: "15 22 * * 1-5"   # 22:15 UTC Mon-Fri (about 6:15 PM New York), after the close
+  workflow_dispatch:          # adds a "Run workflow" button for manual runs
+
+permissions:
+  contents: write             # lets the job save the data file to the repo
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install libraries
+        run: pip install yfinance pandas lxml requests
+
+      - name: Download data
+        env:
+          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+        run: python update_data.py
+
+      - name: Save to repository
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          git add data/screener_data.csv
+          git diff --cached --quiet || git commit -m "Update screener data"
+          git push
